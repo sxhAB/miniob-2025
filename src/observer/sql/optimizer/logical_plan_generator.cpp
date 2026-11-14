@@ -18,6 +18,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "sql/operator/calc_logical_operator.h"
 #include "sql/operator/delete_logical_operator.h"
+#include "sql/operator/update_logical_operator.h"
 #include "sql/operator/explain_logical_operator.h"
 #include "sql/operator/insert_logical_operator.h"
 #include "sql/operator/join_logical_operator.h"
@@ -29,6 +30,7 @@ See the Mulan PSL v2 for more details. */
 
 #include "sql/stmt/calc_stmt.h"
 #include "sql/stmt/delete_stmt.h"
+#include "sql/stmt/update_stmt.h"
 #include "sql/stmt/explain_stmt.h"
 #include "sql/stmt/filter_stmt.h"
 #include "sql/stmt/insert_stmt.h"
@@ -66,6 +68,10 @@ RC LogicalPlanGenerator::create(Stmt *stmt, unique_ptr<LogicalOperator> &logical
       DeleteStmt *delete_stmt = static_cast<DeleteStmt *>(stmt);
 
       rc = create_plan(delete_stmt, logical_operator);
+    } break;
+
+    case StmtType::UPDATE: {
+      rc = create_plan(static_cast<UpdateStmt *>(stmt), logical_operator);
     } break;
 
     case StmtType::EXPLAIN: {
@@ -261,6 +267,27 @@ RC LogicalPlanGenerator::create_plan(DeleteStmt *delete_stmt, unique_ptr<Logical
 
   logical_operator = std::move(delete_oper);
   return rc;
+}
+
+RC LogicalPlanGenerator::create_plan(UpdateStmt *update_stmt, unique_ptr<LogicalOperator> &logical_operator)
+{
+  unique_ptr<LogicalOperator> table_get(new TableGetLogicalOperator(update_stmt->table(), ReadWriteMode::READ_WRITE));
+  unique_ptr<LogicalOperator> predicate;
+  RC rc = create_plan(update_stmt->filter_stmt(), predicate);
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
+
+  unique_ptr<LogicalOperator> update(new UpdateLogicalOperator(
+      update_stmt->table(), update_stmt->field(), update_stmt->value()));
+  if (predicate) {
+    predicate->add_child(std::move(table_get));
+    update->add_child(std::move(predicate));
+  } else {
+    update->add_child(std::move(table_get));
+  }
+  logical_operator = std::move(update);
+  return RC::SUCCESS;
 }
 
 RC LogicalPlanGenerator::create_plan(ExplainStmt *explain_stmt, unique_ptr<LogicalOperator> &logical_operator)

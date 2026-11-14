@@ -172,6 +172,16 @@ RC MvccTrx::delete_record(Table *table, Record &record)
   return RC::SUCCESS;
 }
 
+RC MvccTrx::update_record(Table *table, Record &old_record, Record &new_record)
+{
+  // Reuse version visibility, logging and rollback for DELETE + INSERT.
+  RC rc = delete_record(table, old_record);
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
+  return insert_record(table, new_record);
+}
+
 RC MvccTrx::visit_record(Table *table, Record &record, ReadWriteMode mode)
 {
   Field begin_field;

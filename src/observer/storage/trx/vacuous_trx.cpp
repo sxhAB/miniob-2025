@@ -34,6 +34,24 @@ RC VacuousTrx::insert_record(Table *table, Record &record) { return table->inser
 
 RC VacuousTrx::delete_record(Table *table, Record &record) { return table->delete_record(record); }
 
+RC VacuousTrx::update_record(Table *table, Record &old_record, Record &new_record)
+{
+  // Keep the old row intact if inserting the replacement fails.
+  RC rc = insert_record(table, new_record);
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
+  rc = delete_record(table, old_record);
+  if (rc != RC::SUCCESS) {
+    RC rollback_rc = delete_record(table, new_record);
+    if (rollback_rc != RC::SUCCESS) {
+      LOG_ERROR("failed to remove replacement record. rc=%s", strrc(rollback_rc));
+      return rollback_rc;
+    }
+  }
+  return rc;
+}
+
 RC VacuousTrx::visit_record(Table *table, Record &record, ReadWriteMode) { return RC::SUCCESS; }
 
 RC VacuousTrx::start_if_need() { return RC::SUCCESS; }

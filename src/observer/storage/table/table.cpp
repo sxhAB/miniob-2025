@@ -251,6 +251,20 @@ RC Table::make_record(int value_num, const Value *values, Record &record)
   return RC::SUCCESS;
 }
 
+RC Table::make_update_record(const Record &old_record, const FieldMeta &field, const Value &value, Record &new_record)
+{
+  if (field.type() != value.attr_type()) {
+    return RC::SCHEMA_FIELD_TYPE_MISMATCH;
+  }
+  RC rc = new_record.copy_data(old_record.data(), table_meta_.record_size());
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
+  // Clear padding as well: a shorter CHAR must not retain the old suffix.
+  memset(new_record.data() + field.offset(), 0, field.len());
+  return set_value_to_record(new_record.data(), value, &field);
+}
+
 RC Table::set_value_to_record(char *record_data, const Value &value, const FieldMeta *field)
 {
   size_t       copy_len = field->len();

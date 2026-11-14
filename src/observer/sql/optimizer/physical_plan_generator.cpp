@@ -20,6 +20,8 @@ See the Mulan PSL v2 for more details. */
 #include "sql/operator/calc_physical_operator.h"
 #include "sql/operator/delete_logical_operator.h"
 #include "sql/operator/delete_physical_operator.h"
+#include "sql/operator/update_logical_operator.h"
+#include "sql/operator/update_physical_operator.h"
 #include "sql/operator/explain_logical_operator.h"
 #include "sql/operator/explain_physical_operator.h"
 #include "sql/operator/expr_vec_physical_operator.h"
@@ -73,6 +75,10 @@ RC PhysicalPlanGenerator::create(LogicalOperator &logical_operator, unique_ptr<P
 
     case LogicalOperatorType::DELETE: {
       return create_plan(static_cast<DeleteLogicalOperator &>(logical_operator), oper, session);
+    } break;
+
+    case LogicalOperatorType::UPDATE: {
+      return create_plan(static_cast<UpdateLogicalOperator &>(logical_operator), oper, session);
     } break;
 
     case LogicalOperatorType::EXPLAIN: {
@@ -276,6 +282,21 @@ RC PhysicalPlanGenerator::create_plan(DeleteLogicalOperator &delete_oper, unique
     oper->add_child(std::move(child_physical_oper));
   }
   return rc;
+}
+
+RC PhysicalPlanGenerator::create_plan(UpdateLogicalOperator &update_oper, unique_ptr<PhysicalOperator> &oper, Session *session)
+{
+  if (update_oper.children().size() != 1) {
+    return RC::INTERNAL;
+  }
+  unique_ptr<PhysicalOperator> child;
+  RC rc = create(*update_oper.children()[0], child, session);
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
+  oper.reset(new UpdatePhysicalOperator(update_oper.table(), update_oper.field(), update_oper.value()));
+  oper->add_child(std::move(child));
+  return RC::SUCCESS;
 }
 
 RC PhysicalPlanGenerator::create_plan(ExplainLogicalOperator &explain_oper, unique_ptr<PhysicalOperator> &oper, Session* session)
