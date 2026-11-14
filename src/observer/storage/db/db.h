@@ -70,6 +70,9 @@ public:
   RC create_table(const char *table_name, span<const AttrInfoSqlNode> attributes, const vector<string> &primary_keys,
       const StorageFormat storage_format = StorageFormat::ROW_FORMAT);
 
+  /// @brief 删除表，释放内存资源并删除该表的元数据、数据和索引文件。
+  RC drop_table(const char *table_name);
+
   /**
    * @brief 根据表名查找表
    */
@@ -146,5 +149,6 @@ private:
   int32_t next_table_id_ = 0;
 
   LSN    check_point_lsn_ = 0;  ///< 当前数据库的检查点LSN。会记录到磁盘中。
+  bool   dropped_table_since_sync_ = false;  ///< 删除表后，下次检查点需要跳过已删除表的旧日志。
   string storage_engine_;
 };

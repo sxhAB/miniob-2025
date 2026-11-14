@@ -49,6 +49,9 @@ public:
    */
   void update_table_stats(int table_id, const TableStats &table_stats);
 
+  /// @brief 删除表时释放其内存中的统计信息。
+  void remove_table_stats(int table_id);
+
   /**
    * @brief Gets the singleton instance of the Catalog.
    *

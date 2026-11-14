@@ -75,7 +75,9 @@ RC DiskLogHandler::await_termination()
 
 RC DiskLogHandler::replay(LogReplayer &replayer, LSN start_lsn)
 {
-  LSN max_lsn = 0;
+  // 起点之前的日志已经包含在检查点中。即使起点之后没有日志，也不能从 0
+  // 重新编号，否则 DROP 后重启产生的新日志会复用旧 LSN。
+  LSN max_lsn = start_lsn > 0 ? start_lsn - 1 : 0;
   auto replay_callback = [&replayer, &max_lsn](LogEntry &entry) -> RC {
     if (entry.lsn() > max_lsn) {
       max_lsn = entry.lsn();

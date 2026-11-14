@@ -18,9 +18,11 @@ See the Mulan PSL v2 for more details. */
 #include <sys/stat.h>
 
 #include "common/lang/string.h"
+#include "common/lang/algorithm.h"
 #include "common/log/log.h"
 #include "common/os/path.h"
 #include "common/global_context.h"
+#include "catalog/catalog.h"
 #include "storage/common/meta_util.h"
 #include "storage/table/table.h"
 #include "storage/table/table_meta.h"
@@ -176,6 +178,47 @@ RC Db::create_table(const char *table_name, span<const AttrInfoSqlNode> attribut
   return RC::SUCCESS;
 }
 
+RC Db::drop_table(const char *table_name)
+{
+  auto iter = opened_tables_.find(table_name);
+  if (iter == opened_tables_.end()) {
+    return RC::SCHEMA_TABLE_NOT_EXIST;
+  }
+
+  Table *table = iter->second;
+  // 析构 Table 后元数据也会被释放，所以先保存准确的文件路径。
+  const string name = table->name();
+  const TableMeta &meta = table->table_meta();
+  vector<string> files;
+  for (int i = 0; i < meta.index_num(); i++) {
+    files.emplace_back(table_index_file(path_.c_str(), name.c_str(), meta.index(i)->name()));
+  }
+  files.emplace_back(table_data_file(path_.c_str(), name.c_str()));
+  files.emplace_back(table_lob_file(path_.c_str(), name.c_str()));
+  files.emplace_back(table_meta_file(path_.c_str(), name.c_str()));
+
+  Catalog::get_instance().remove_table_stats(table->table_id());
+  opened_tables_.erase(iter);
+  // 复用析构链：释放记录处理器和索引，关闭文件并清理 buffer pool。
+  // 必须先关闭，再删除磁盘文件，避免留下旧文件句柄和缓存。
+  delete table;
+
+  RC rc = RC::SUCCESS;
+  for (const string &file : files) {
+    error_code ec;
+    filesystem::remove(file, ec);
+    // .lob 等文件可能从未创建；不存在表示无需清理，不视为错误。
+    if (ec) {
+      LOG_ERROR("Failed to remove table file. file=%s, error=%s", file.c_str(), ec.message().c_str());
+      rc = RC::FILE_REMOVE;
+    }
+  }
+  if (OB_SUCC(rc)) {
+    dropped_table_since_sync_ = true;
+  }
+  return rc;
+}
+
 Table *Db::find_table(const char *table_name) const
 {
   unordered_map<string, Table *>::const_iterator iter = opened_tables_.find(table_name);
@@ -260,6 +303,9 @@ RC Db::sync()
   auto dblwr_buffer = static_cast<DiskDoubleWriteBuffer *>(buffer_pool_manager_->get_dblwr_buffer());
   rc                = dblwr_buffer->flush_page();
   LOG_INFO("double write buffer flush pages ret=%s", strrc(rc));
+  if (OB_FAIL(rc)) {
+    return rc;
+  }
 
   /*
   在sync期间，不允许有未完成的事务，也不允许开启新的事物。
@@ -272,12 +318,15 @@ RC Db::sync()
     return rc;
   }
 
-  check_point_lsn_ = current_lsn;
+  // 日志回放从起点 LSN（含）开始。DROP 本身不产生数据页日志，因此需要在删除后
+  // 持久化 current_lsn + 1，防止重启时重放指向已删除表和索引的旧日志。
+  check_point_lsn_ = max(check_point_lsn_, current_lsn + (dropped_table_since_sync_ ? 1 : 0));
   rc               = flush_meta();
   if (OB_FAIL(rc)) {
     LOG_ERROR("Failed to flush meta. db=%s, rc=%d:%s", name_.c_str(), rc, strrc(rc));
     return rc;
   }
+  dropped_table_since_sync_ = false;
   LOG_INFO("Successfully sync db. db=%s", name_.c_str());
   return rc;
 }
