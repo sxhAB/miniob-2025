@@ -208,6 +208,16 @@ RC LogicalPlanGenerator::create_plan(FilterStmt *filter_stmt, unique_ptr<Logical
                                      ? static_cast<Expression *>(new FieldExpr(filter_obj_right.field))
                                      : static_cast<Expression *>(new ValueExpr(filter_obj_right.value)));
 
+    // 字符串与数值比较时按数值前缀转换为浮点数，避免 "16.5a" 与 INT
+    // 比较时被截断成 16。两侧都是字符串时仍保留字符串比较。
+    if (left->value_type() == AttrType::CHARS &&
+        (right->value_type() == AttrType::INTS || right->value_type() == AttrType::FLOATS)) {
+      left = make_unique<CastExpr>(std::move(left), AttrType::FLOATS);
+    } else if (right->value_type() == AttrType::CHARS &&
+               (left->value_type() == AttrType::INTS || left->value_type() == AttrType::FLOATS)) {
+      right = make_unique<CastExpr>(std::move(right), AttrType::FLOATS);
+    }
+
     if (left->value_type() != right->value_type()) {
       auto left_to_right_cost = implicit_cast_cost(left->value_type(), right->value_type());
       auto right_to_left_cost = implicit_cast_cost(right->value_type(), left->value_type());
