@@ -106,10 +106,53 @@ RC LogicalPlanGenerator::create_plan(SelectStmt *select_stmt, unique_ptr<Logical
     return rc;
   }
 
+  // INNER JOIN 的 AND 条件可以在所需的表都出现后立即执行，
+  // 不必等所有表做完笛卡尔积。复用上面已完成类型转换的比较表达式。
+  vector<unique_ptr<Expression>> predicates;
+  if (predicate_oper) {
+    auto *conjunction = static_cast<ConjunctionExpr *>(predicate_oper->expressions().front().get());
+    predicates.swap(conjunction->children());
+    predicate_oper.reset();
+  }
+
+  auto apply_predicates = [&](unique_ptr<LogicalOperator> &oper, const vector<Table *> &available_tables) {
+    vector<unique_ptr<Expression>> ready;
+    for (auto iter = predicates.begin(); iter != predicates.end();) {
+      bool available = true;
+      function<RC(unique_ptr<Expression> &)> check_fields = [&](unique_ptr<Expression> &expr) -> RC {
+        if (expr->type() == ExprType::FIELD) {
+          const Table *table = static_cast<FieldExpr *>(expr.get())->field().table();
+          bool found = false;
+          for (Table *available_table : available_tables) {
+            found = found || table == available_table;
+          }
+          available = available && found;
+        }
+        return ExpressionIterator::iterate_child_expr(*expr, check_fields);
+      };
+      check_fields(*iter);
+      if (available) {
+        ready.emplace_back(std::move(*iter));
+        iter = predicates.erase(iter);
+      } else {
+        ++iter;
+      }
+    }
+    if (!ready.empty()) {
+      auto conjunction = make_unique<ConjunctionExpr>(ConjunctionExpr::Type::AND, ready);
+      auto predicate = make_unique<PredicateLogicalOperator>(std::move(conjunction));
+      predicate->add_child(std::move(oper));
+      oper = std::move(predicate);
+    }
+  };
+
   const vector<Table *> &tables = select_stmt->tables();
+  vector<Table *> joined_tables;
   for (Table *table : tables) {
 
     unique_ptr<LogicalOperator> table_get_oper(new TableGetLogicalOperator(table, ReadWriteMode::READ_ONLY));
+    // 只依赖单表的条件先过滤单表，减少参与连接的数据。
+    apply_predicates(table_get_oper, vector<Table *>{table});
     if (table_oper == nullptr) {
       table_oper = std::move(table_get_oper);
     } else {
@@ -118,15 +161,8 @@ RC LogicalPlanGenerator::create_plan(SelectStmt *select_stmt, unique_ptr<Logical
       join_oper->add_child(std::move(table_get_oper));
       table_oper = unique_ptr<LogicalOperator>(join_oper);
     }
-  }
-
-
-  if (predicate_oper) {
-    if (*last_oper) {
-      predicate_oper->add_child(std::move(*last_oper));
-    }
-
-    last_oper = &predicate_oper;
+    joined_tables.push_back(table);
+    apply_predicates(table_oper, joined_tables);
   }
 
   unique_ptr<LogicalOperator> group_by_oper;

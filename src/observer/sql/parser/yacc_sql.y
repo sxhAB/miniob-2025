@@ -96,6 +96,8 @@ UnboundAggregateExpr *create_aggregate_expression(const char *aggregate_name,
         INTO
         VALUES
         FROM
+        INNER
+        JOIN
         WHERE
         AND
         SET
@@ -133,7 +135,7 @@ UnboundAggregateExpr *create_aggregate_expression(const char *aggregate_name,
   vector<Value> *                            value_list;
   vector<ConditionSqlNode> *                 condition_list;
   vector<RelAttrSqlNode> *                   rel_attr_list;
-  vector<string> *                           relation_list;
+  FromSqlNode *                              from;
   vector<string> *                           key_list;
   char *                                     cstring;
   int                                        number;
@@ -149,7 +151,7 @@ UnboundAggregateExpr *create_aggregate_expression(const char *aggregate_name,
 %destructor { delete $$; } <value_list>
 %destructor { delete $$; } <condition_list>
 // %destructor { delete $$; } <rel_attr_list>
-%destructor { delete $$; } <relation_list>
+%destructor { delete $$; } <from>
 %destructor { delete $$; } <key_list>
 
 %token <number> NUMBER
@@ -174,7 +176,9 @@ UnboundAggregateExpr *create_aggregate_expression(const char *aggregate_name,
 %type <cstring>             storage_format
 %type <key_list>            primary_key
 %type <key_list>            attr_list
-%type <relation_list>       rel_list
+%type <from>                rel_list
+%type <from>                joined_table
+%type <condition_list>      join_condition_list
 %type <expression>          expression
 %type <expression>          aggregate_expression
 %type <expression_list>     expression_list
@@ -494,12 +498,15 @@ select_stmt:        /*  select 语句的语法解析树*/
       }
 
       if ($4 != nullptr) {
-        $$->selection.relations.swap(*$4);
+        $$->selection.relations.swap($4->relations);
+        $$->selection.conditions.swap($4->conditions);
         delete $4;
       }
 
       if ($5 != nullptr) {
-        $$->selection.conditions.swap(*$5);
+        // 对 INNER JOIN，ON 与 WHERE 都是必须满足的过滤条件。
+        auto &conditions = $$->selection.conditions;
+        conditions.insert(conditions.end(), $5->begin(), $5->end());
         delete $5;
       }
 
@@ -597,18 +604,41 @@ relation:
     }
     ;
 rel_list:
-    relation {
-      $$ = new vector<string>();
-      $$->push_back($1);
+    joined_table {
+      $$ = $1;
     }
-    | relation COMMA rel_list {
-      if ($3 != nullptr) {
-        $$ = $3;
-      } else {
-        $$ = new vector<string>;
-      }
+    | rel_list COMMA joined_table {
+      $$ = $1;
+      $$->relations.insert($$->relations.end(), $3->relations.begin(), $3->relations.end());
+      $$->conditions.insert($$->conditions.end(), $3->conditions.begin(), $3->conditions.end());
+      delete $3;
+    }
+    ;
 
-      $$->insert($$->begin(), $1);
+joined_table:
+    relation {
+      $$ = new FromSqlNode;
+      $$->relations.emplace_back($1);
+    }
+    | joined_table INNER JOIN relation ON join_condition_list {
+      $$ = $1;
+      $$->relations.emplace_back($4);
+      $$->conditions.insert($$->conditions.end(), $6->begin(), $6->end());
+      delete $6;
+    }
+    ;
+
+// ON 后至少需要一个条件，AND 后也必须有完整的条件。
+join_condition_list:
+    condition {
+      $$ = new vector<ConditionSqlNode>;
+      $$->emplace_back(*$1);
+      delete $1;
+    }
+    | join_condition_list AND condition {
+      $$ = $1;
+      $$->emplace_back(*$3);
+      delete $3;
     }
     ;
 

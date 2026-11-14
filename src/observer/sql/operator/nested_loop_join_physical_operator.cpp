@@ -51,6 +51,10 @@ RC NestedLoopJoinPhysicalOperator::next()
     }
 
     rc = right_next();
+    if (rc == RC::SUCCESS) {
+      // 每次 next() 只产出一对记录，交给上层过滤或输出。
+      return rc;
+    }
     if (rc != RC::SUCCESS) {
       if (rc == RC::RECORD_EOF) {
         rc = RC::SUCCESS;

@@ -76,6 +76,16 @@ struct ConditionSqlNode
 };
 
 /**
+ * @brief 语法解析期间收集 FROM 中的表和 INNER JOIN 条件
+ * @ingroup SQLParser
+ */
+struct FromSqlNode
+{
+  vector<string>           relations;   ///< FROM 中按书写顺序出现的表
+  vector<ConditionSqlNode> conditions;  ///< INNER JOIN 的 ON 条件，使用 AND 连接
+};
+
+/**
  * @brief 描述一个select语句
  * @ingroup SQLParser
  * @details 一个正常的select语句描述起来比这个要复杂很多，这里做了简化。
