@@ -1,157 +1,121 @@
-# DROP TABLE 实现说明
+# DROP TABLE 实现详解
 
-本次仅实现题目要求的 `DROP TABLE table_name;`，以及完成删除所必需的资源清理和重启恢复衔接。
+本次实现题目要求的 `DROP TABLE table_name;`，重点是把表从当前数据库中彻底移除：SQL 请求能到达存储层，表及索引的内存资源先正确关闭，随后删除准确的磁盘文件，并保证重启时不会重放已删除表的旧日志。
 
-## 1. 先理解：数据库中的一张表不只是一个文件
+本文面向只有 SQL 基础的读者。先看最重要的执行流程和设计原因，再列出每个改动文件。不是本题重点的接口接线和已有机制只简要说明。
 
-假设执行：
+## 1. 最终效果与执行流程
 
 ```sql
-CREATE TABLE students(id INT, score INT);
-CREATE INDEX idx_id ON students(id);
-INSERT INTO students VALUES (1, 90);
+DROP TABLE students;
 ```
 
-MiniOB 会在磁盘和内存中管理这张表的多种资源：
+`DROP TABLE` 删除整张表，包括表结构、数据和索引。它不同于 `DELETE FROM students;`：`DELETE` 删除行，但表还在；`DROP TABLE` 删除表本身。删除后再查询该表会报表不存在，表名可以重新使用。
 
-| 资源 | 作用 | 删除时的处理 |
-| --- | --- | --- |
-| `students.table` | 元数据，记录列的名称、类型、索引定义等 | 删除文件 |
-| `students.data` | 保存实际的行数据 | 先关闭，再删除文件 |
-| `students-idx_id.index` | 根据 id 查找行的索引数据 | 先释放索引对象、关闭文件，再删除文件 |
-| `students.lob`（可能不存在） | 代码中预留的大对象文件 | 如果存在则删除 |
-| 数据库中的 `Table` 对象 | 内存中代表这张表的对象 | 释放对象 |
-| `opened_tables_` 中的条目 | 让数据库可以通过表名查找 `Table` | 移除条目 |
-| 索引对象和文件缓存 | 加速读写的内存资源 | 通过已有析构流程释放 |
-| `Catalog` 中的表统计信息 | 例如行数，供优化器使用 | 移除该表对应的统计信息 |
-
-所以 `DELETE FROM students;` 和 `DROP TABLE students;` 的意义不同：前者删除行，表结构仍保留；后者连同表结构、数据和索引一起删除。
-
-## 2. SQL 怎样到达真正的删除代码
+SQL 在 MiniOB 里的主要路径是：
 
 ```text
-DROP TABLE students;
-        ↓
-已有 SQL 解析器：识别 DROP TABLE，提取表名 students
-        ↓
-Stmt::create_stmt：创建 DropTableStmt，并检查表是否存在
-        ↓
-CommandExecutor：选择 DropTableExecutor
-        ↓
-DropTableExecutor：取得当前数据库，调用 Db::drop_table
-        ↓
-Db::drop_table：释放内存对象，删除相关文件
-        ↓
-已有 DDL 后同步流程：Db::sync
-        ↓
-把执行结果返回给客户端
+SQL 文本
+  -> 解析器产出 SCF_DROP_TABLE 和表名
+  -> Stmt::create_stmt 创建 DropTableStmt
+  -> CommandExecutor 分发给 DropTableExecutor
+  -> Db::drop_table 关闭资源并删除文件
+  -> DDL 通用流程调用 Db::sync
 ```
 
-原代码的 SQL 语法规则已经支持 `DROP TABLE`，`StmtType::DROP_TABLE` 也已经存在，因此没有修改词法、语法或新增其他 SQL 语法。
+几个术语：`Stmt` 是解析并做过基本检查后的语句对象；`Executor` 是负责执行该类语句的组件；`Db` 是当前数据库的对象，管理已打开的表；`Table` 是内存中代表一张表的对象；buffer pool 是数据库用来缓存磁盘页的内存区域；LSN 是日志记录的顺序编号；checkpoint（检查点）决定重启时从哪条日志开始恢复。
 
-## 3. 每部分修改及原因
+## 2. 关键修改一：Db 负责完整删除
 
-### 语句对象：`drop_table_stmt.h/.cpp`、`stmt.cpp`
+主要文件：`src/observer/storage/db/db.h`、`src/observer/storage/db/db.cpp`。
 
-新增 `DropTableStmt`，保存表名，返回类型 `StmtType::DROP_TABLE`。在 `Stmt::create_stmt` 中增加 `SCF_DROP_TABLE` 分支。
+`Db` 原本就通过 `opened_tables_` 保存“表名到 `Table*`”的映射，所以删除入口放在 `Db`，而不是让 SQL 执行器直接碰文件。新增的 `Db::drop_table` 是核心实现，按这个顺序工作：
 
-这里检查数据库中是否存在这张表；不存在时返回 `RC::SCHEMA_TABLE_NOT_EXIST`。普通文本协议通常把错误显示为 `FAILURE`。
+1. 在 `opened_tables_` 中查找目标表。找不到就返回 `SCHEMA_TABLE_NOT_EXIST`，不做文件删除。
+2. 趁 `Table` 和它的元数据仍然有效，收集 `.table` 元数据文件、`.data` 数据文件、`.lob` 可选文件，以及元数据中列出的每个索引文件的完整路径。
+3. 清除该表的 Catalog 统计信息，并从 `opened_tables_` 移除映射，防止数据库继续按表名找到它。
+4. `delete table`，走已有析构函数，释放记录管理器、索引对象和文件缓存。
+5. 删除之前保存的文件路径。真实文件系统错误记日志并返回 `RC::FILE_REMOVE`；不存在的可选 `.lob` 文件不算错误。
+6. 所有文件删除成功后，标记下次同步需要推进恢复检查点。
 
-语句对象保存的是表名字符串，没有长期保存 `Table *`。因为执行 DROP 后 `Table` 会被释放，而语句对象还需要保留到请求处理结束；保存独立的表名更容易避免引用已释放对象。
+先保存文件路径是为了避免悬空指针。`delete table` 后，`table` 和 `TableMeta` 都已经释放，再从 `table->name()` 或索引元数据取文件名就是访问已失效内存。按索引元数据逐一构造准确路径，也避免按表名前缀删除时误伤 `students_backup` 这类相似名称的表。
 
-### 执行器：`drop_table_executor.h/.cpp`、`command_executor.cpp`
+顺序上先关闭资源、再删文件。Windows 等系统通常不允许删除仍被打开的文件；即使文件系统允许 unlink，数据库进程里遗留的句柄和缓存也会让后续重建同名表变得不可靠。
 
-新增执行器并接入命令分发。执行器只负责从请求中取得表名和当前数据库，然后调用 `Db::drop_table`。
+`db.h` 只增加公开的 `drop_table` 声明和一个状态位 `dropped_table_since_sync_`。状态位用于下一节的检查点处理。
 
-这样沿用项目现有的结构：SQL 层处理 SQL 请求，存储层处理表和文件。执行器不需要知道索引文件叫什么，也不需要自己管理缓存。
+## 3. 关键修改二：复用析构链关闭文件和缓存
 
-### 真正删除：`db.h/.cpp`
-
-`Db` 已经管理 `opened_tables_`，其中保存“表名 → Table 指针”，因此删除入口放在 `Db` 中。
-
-`Db::drop_table` 按以下顺序操作：
-
-1. 查找表。找不到就返回“表不存在”，不删除文件。
-2. 在 Table 仍然有效时，读取它的元数据，保存全部索引文件、数据文件、大对象文件和元数据文件的完整路径。
-3. 删除该表的统计信息，并从 `opened_tables_` 移除该表。
-4. 执行 `delete table`，复用已有析构流程释放内存资源并关闭文件。
-5. 按保存的准确路径逐一删除文件。
-6. 删除成功后，记录下次数据库同步需要跳过这张表的旧日志。
-
-为什么先保存路径？因为 `delete table` 后，表元数据也会释放，此后再调用 `table->name()` 或读取索引定义，就会访问已经失效的内存。
-
-为什么按元数据列举文件？因为 `students` 和 `students_backup` 可能同时存在。直接按照表名前缀批量删文件容易误删其他表；列举准确路径能限定删除范围，也能删除该表的所有索引。
-
-为什么先关闭再删除文件？因为打开的文件句柄、缓存、索引对象需要一起清理。只删除磁盘路径，不能自动把数据库自己的这些资源都释放掉。
-
-文件通过 `filesystem::remove(file, ec)` 删除：可选的 `.lob` 文件不存在时不算错误；真实的文件系统错误会记录日志并返回 `RC::FILE_REMOVE`，并继续尝试清理剩余文件。
-
-### 内存释放：复用原有析构链
-
-这部分已有代码足够使用，没有额外重写存储引擎：
+删除文件之前要释放的不是单个文件句柄，而是围绕表构建的一串对象。这里没有重写存储引擎，而是复用已有析构流程：
 
 ```text
 delete Table
-    ├─ 释放 LobFileHandler（如果有）
-    └─ unique_ptr 自动释放 HeapTableEngine
-           ├─ 释放 RecordFileHandler
-           ├─ 关闭数据文件及其 buffer pool
-           └─ 逐一 delete Index
-                  └─ 关闭索引的 B+ 树及其 buffer pool
+  -> Table::~Table
+     -> 释放 HeapTableEngine
+        -> 删除 RecordFileHandler
+        -> 关闭数据文件和它的 buffer pool
+        -> 逐个 delete 索引
+           -> B+ 树索引关闭索引文件
+     -> 释放可选的 LobFileHandler
 ```
 
-buffer pool 可以理解成数据库自己的“文件页面缓存”。原有 `DiskBufferPool::close_file` 会清理缓存页、处理 double write buffer 中对应的页、关闭文件，并从 `BufferPoolManager` 中注销该文件。
+buffer pool 里的页可能还指向待删除文件。`DiskBufferPool::close_file` 会清掉该文件相关缓存页和 double-write 状态，关闭文件句柄，并把文件从 `BufferPoolManager` 注销。若只调用文件删除函数，内存中的页和句柄并不会自动跟着消失。
 
-这里不能只对索引指针容器调用 `clear()`：容器中的元素是指针，清空容器本身并不会自动 `delete` 指针指向的对象。已有的 `HeapTableEngine` 析构函数已经逐一释放索引，因此直接复用。
+这里使用 `delete` 而不只是清空索引指针数组：数组存的是裸指针，清空容器本身不会释放指针所指对象。`HeapTableEngine` 的析构函数已经逐个删除索引，因而直接利用已有逻辑。
 
-### 统计信息：`catalog.h/.cpp`
+## 4. 关键修改三：检查点必须越过旧日志
 
-增加 `remove_table_stats(table_id)`，在原来的互斥锁保护下执行 `table_stats_.erase(table_id)`。
+只删文件和内存还不够。MiniOB 重启时会读取数据库检查点，然后从该 LSN（包含该编号）开始重放日志。旧日志可能包含对这张表或它的索引文件的修改；若重启后再重放这些日志，文件已经删掉，恢复可能失败。
 
-原因是统计信息由全局 `Catalog` 管理，不属于 `Table` 的成员，不能指望 `delete table` 自动删除它。本次只增加删除接口，没有调整统计信息的其他功能。
+核心修改在 `Db::sync`：成功删除表后设置 `dropped_table_since_sync_`。下次同步先刷新仍然存在的表和 double-write buffer，再等待当前日志写入完成，最后将检查点推进到至少 `current_lsn + 1`。因为重放包含起点本身，`+1` 才能跳过截至 `current_lsn` 的旧记录。
 
-## 4. 为什么还需要处理日志恢复
+这里还有两个容易忽略的细节：
 
-数据库重启时不仅会读取 `.table` 文件，还会重放日志。可以把日志理解成一份按顺序编号的操作记录；这个编号叫 LSN。
+- 检查点取“原值”和新候选值中的较大者。删除命令成功后已经自动同步一次，而进程退出时可能再同步；如果第二次同步把检查点降回当前 LSN，重启就会重新触碰旧日志。
+- double-write buffer 刷新失败时直接返回，不推进检查点。否则检查点可能越过尚未安全落盘的数据。
 
-原代码的重放从指定 LSN 开始，包含这个编号。例如当前最后一条日志为 100：如果删表后仍保存 100 作为恢复起点，下次重启可能再次执行第 100 条日志。如果它指向已删除的表或索引，就会找不到对应的 buffer pool，导致数据库启动失败。
+同步写入数据库元数据文件成功后才清除删除状态。数据库日志是多个表共享的，不能为了删除一张表就删掉整个日志目录，否则会丢失其他表需要恢复的修改。
 
-因此增加与 DROP 相关的处理：
+`src/observer/storage/clog/disk_log_handler.cpp` 还有一处配套调整：如果检查点之后没有新日志，磁盘日志回放仍要把“已知最大 LSN”初始化为 `start_lsn - 1`。否则重启后的新日志编号可能从 1 重新开始，与旧编号冲突，后续恢复又会出错。
 
-- `Db::drop_table` 成功后设置 `dropped_table_since_sync_`。
-- `Db::sync` 在其余表及 double write buffer 同步完成、已有日志写入完成后，保存 `current_lsn + 1` 作为 DROP 后的恢复起点。
-- 检查点取新旧起点的较大值，避免退出时再次同步把起点退回旧日志。
-- double write buffer 同步失败时立即返回，不能把失败当成已完成并推进检查点。
-- `DiskLogHandler::replay` 从至少 `start_lsn - 1` 初始化已知最大 LSN。即使恢复起点之后没有日志，重启后新日志也会继续正确编号，不会重新从 1 开始。
+## 5. SQL 层接线与辅助清理
 
-最后这一点很重要：删除后能够重启，还必须能够在重启后重新建表、写入数据并再次重启。
+这些改动对理解资源释放和恢复不是核心，但它们把新命令接入项目已有的 SQL 结构。
 
-日志是整个数据库共享的，其中可能包含其他表的记录，因此这里没有直接删除整个日志目录。
+### 语句对象
 
-## 5. 已完成的验证
+`src/observer/sql/stmt/drop_table_stmt.h` 和 `.cpp` 新增 `DropTableStmt`：保存表名、报告 `StmtType::DROP_TABLE`，并在创建语句时检查表是否存在。它保存表名字符串而不是 `Table*`，因为执行器稍后会删除那个 `Table` 对象。`src/observer/sql/stmt/stmt.cpp` 增加 `SCF_DROP_TABLE` 到 `DropTableStmt::create` 的分支。
 
-开发时通过临时定向测试检查了以下场景；按要求，测试源文件不包含在本次提交中：
+解析器的 `DROP TABLE` 语法和 `StmtType::DROP_TABLE` 已经存在，本次没有改词法/语法。`stmt_type_ddl` 也已有 DROP_TABLE，因此成功的 DDL 会进入现有的 `Db::sync` 逻辑。
 
-- SQL 能解析为 DROP TABLE，并生成正确的语句对象。
-- 删除空表、重复删除和删除不存在的表。
-- 删除含数据、两个索引、可选大对象文件和统计信息的表。
-- 名称相近的另一张表仍然保留。
-- 对应的文件不再登记在 buffer pool 管理器中，缓存页数量恢复到删除前的基线。
-- 可以重建同名表和同名索引，且新表中没有旧数据。
-- 删除从磁盘加载的表后，经过重复同步仍可重启。
-- 重启后重建并插入数据，再次重启仍能读取新记录。
+### 执行器和命令分发
 
-在 Linux/MiniOB 开发容器中重新配置和构建数据库：
+`src/observer/sql/executor/drop_table_executor.h/.cpp` 新增轻量执行器：从 SQL 事件取得语句和当前数据库，再把表名交给 `Db::drop_table`。`command_executor.cpp` 增加一个 `DROP_TABLE` 分支选择此执行器。执行器不负责拼路径、释放索引或操作 buffer pool，这些属于存储层 `Db` 的职责。
 
-```bash
-cmake -S . -B build
-cmake --build build --target observer -j 6
-```
+### Catalog 统计
 
-验证时构建开启了 AddressSanitizer，临时测试运行时关闭了全局泄漏扫描；缓存和文件资源的释放另外通过测试中的断言检查。
+`src/observer/catalog/catalog.h/.cpp` 增加 `remove_table_stats(table_id)`，在现有互斥锁保护下移除表统计信息。Catalog 是单独的全局统计信息管理对象，不属于 `Table`，所以销毁 `Table` 不会自动清掉这项数据。
 
-验证结果：数据库服务和测试均编译成功，3 个定向单元测试全部通过。另通过实际 SQL 连接，在默认事务模型的内存日志、磁盘日志两种配置下完成了 50 条 SQL 检查，覆盖删后查询/插入/删除/描述表失败、SHOW TABLES、磁盘文件删除、重建同名表和索引、多次重启后的数据读写。
+文件路径的拼装复用了已有的 `table_meta_file`、`table_data_file`、`table_index_file` 和 `table_lob_file`（定义在 `src/observer/storage/common/meta_util.cpp`），本次没有改这些工具函数。
 
-额外尝试 MVCC 配置时，删除目标表之前的查询未返回刚插入的数据，因此未把这组检查列为通过；本次没有扩展修复事务查询功能。
+## 6. 修改文件总览
 
-本实现沿用项目已有的约束：DDL 和同步期间不并发访问正在删除的表，没有增加表锁、DDL 回滚或删除中途断电的原子恢复机制。
+| 文件 | 修改内容 | 重要性 |
+| --- | --- | --- |
+| `src/observer/storage/db/db.cpp` | 删除顺序、资源关闭、文件移除、检查点状态及同步处理 | 核心 |
+| `src/observer/storage/db/db.h` | 声明删除接口和同步状态 | 核心配套 |
+| `src/observer/storage/clog/disk_log_handler.cpp` | 无新日志时保留正确的最大 LSN，避免编号重用 | 恢复配套 |
+| `src/observer/sql/stmt/drop_table_stmt.h/.cpp` | 保存目标表名并检查表存在 | SQL 接线 |
+| `src/observer/sql/stmt/stmt.cpp` | 把解析结果转换成 `DropTableStmt` | SQL 接线 |
+| `src/observer/sql/executor/drop_table_executor.h/.cpp` | 将执行请求交给当前数据库 | SQL 接线 |
+| `src/observer/sql/executor/command_executor.cpp` | 把 DROP TABLE 分发到新执行器 | SQL 接线 |
+| `src/observer/catalog/catalog.h/.cpp` | 删除目标表的内存统计信息 | 辅助清理 |
+| `docs/drop-table-implementation.md` | 说明实现方案、取舍和验证情况 | 文档 |
+
+## 7. 验证和实现边界
+
+开发时在 Linux/MiniOB 容器中成功构建 `observer`。另用实际 SQL 连接，在默认事务模型下分别测试内存日志和磁盘日志，共检查 50 条 SQL 场景，包括删除与重复删除、删后访问失败、其他表保留、重建同名表和索引，以及多次重启后新数据仍可读。临时定向测试也曾通过；测试源文件按要求未保留，因此这里不提供不可复现的测试文件命令。
+
+MVCC 配置下的额外尝试在 DROP 之前就读不到刚插入的数据，所以不作为本题实现的通过结果；本次没有扩展修复事务查询功能。当前实现也沿用 MiniOB 原有的 DDL 使用约束，没有增加并发删表锁、跨多个文件的原子回滚或删除中途断电后的自动撤销机制。
+
+阅读源码时，建议依次看 `DropTableStmt::create`、`DropTableExecutor::execute`、`Db::drop_table`、`Table::~Table`、`HeapTableEngine::~HeapTableEngine` 和 `Db::sync`。前两处回答“SQL 怎么到存储层”，中间几处回答“资源怎么释放”，最后一处回答“重启为什么不会再碰已删表的旧日志”。

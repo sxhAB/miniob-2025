@@ -1,6 +1,8 @@
-# MiniOB join-tables：INNER JOIN 实现与原理讲解
+# INNER JOIN 实现详解
 
-本文面向了解一些 SQL、还不熟悉数据库内核的读者，说明本次 join-tables 题目修改了什么、为什么这样实现，以及 SQL 如何经过这些代码得到查询结果。
+> 本文面向只有 SQL 基础、还不熟悉数据库内核的读者，按 DATE 讲解文档的方式说明：每个关键文件改了什么、为什么这样改，以及这些修改怎样串起一次查询。
+>
+> 重点讲解语法、条件安排、类型转换和逐条执行四部分。已有模块只说明衔接关系，语法声明和内存释放等次要修改简要带过。
 
 ## 1. 本次实现的范围
 
@@ -108,6 +110,20 @@ SQL 字符串
 
 “逻辑计划”描述要做什么，例如连接两份数据；“物理计划”决定具体怎么做，例如使用嵌套循环逐对组合记录。
 
+### 3.1 阅读代码前需要认识的几个对象
+
+| 对象 | 可以先这样理解 |
+| --- | --- |
+| token | SQL 中识别出的符号，例如 INNER、表名、等号 |
+| SqlNode | 语法解析结果，保存表名、字段名、条件等信息 |
+| Stmt | 经过表、字段检查后的语句对象 |
+| Value | 执行期携带一个值及其类型的对象 |
+| Expression | 字段、常量、比较、类型转换等表达式 |
+| Predicate | 结果为真或假的条件，例如 `t.id=t1.id` |
+| Tuple | 执行过程中可以读取字段的一条记录，不一定是一份独立拷贝 |
+
+本题处理的是查询过程中的记录组合，不需要把连接结果写成一张新表，所以没有修改存储格式、表元数据或 B+ 树结构。
+
 ## 4. 修改文件一览
 
 以下路径相对于仓库根目录：
@@ -168,6 +184,8 @@ struct FromSqlNode
 
 它是语法解析期间的中间结果，不保存表中的实际记录。表名最后进入已有的 `SelectSqlNode::relations`，ON 条件进入已有的 `SelectSqlNode::conditions`。
 
+其中 ConditionSqlNode 也是原来的结构，能表示“左边是什么、运算符是什么、右边是什么”。例如 `t.id=t1.id` 保存两个字段引用和 EQUAL_TO；`t1.age>=18` 保存一个字段、一个常量和 GREAT_EQUAL。因此 ON 无需再增加一套条件对象。
+
 保留表的书写顺序，也有助于保持 `SELECT *` 展开各表字段时的列顺序。
 
 ### 6.2 如何支持连续连接和逗号混用
@@ -214,6 +232,34 @@ FROM t, t1 INNER JOIN t2 ON t1.id = t2.id
 
 每次合并都会追加对应的表名和 ON 条件。
 
+其中连续 JOIN 的关键解析动作是：
+
+```cpp
+| joined_table INNER JOIN relation ON join_condition_list {
+  $$ = $1;
+  $$->relations.emplace_back($4);
+  $$->conditions.insert($$->conditions.end(), $6->begin(), $6->end());
+  delete $6;
+}
+```
+
+`$1`、`$4`、`$6` 是 Bison 对规则右侧位置的编号，`$$` 表示合并后的结果：
+
+```text
+joined_table INNER JOIN relation ON join_condition_list
+     $1        $2   $3     $4    $5          $6
+```
+
+这段代码复用左侧连接组，再追加新表和本次 ON 的条件。连续连接时，结果逐步变成：
+
+```text
+表 [t]          条件 []
+表 [t,t1]       条件 [t.id=t1.id]
+表 [t,t1,t2]    条件 [t.id=t1.id, t1.id=t2.id]
+```
+
+逗号规则则把右侧连接组的 relations 和 conditions 一起追加，避免只接入表、丢失右侧 ON 条件。
+
 ### 6.3 如何支持一个 ON 中的多个条件
 
 新增独立的 `join_condition_list`：
@@ -257,15 +303,53 @@ WHERE t2.id = t.id;
   t2.id = t.id
 ```
 
+这一步对应 select_stmt 中的关键修改：
+
+```cpp
+if ($4 != nullptr) {
+  $$->selection.relations.swap($4->relations);
+  $$->selection.conditions.swap($4->conditions);
+  delete $4;
+}
+
+if ($5 != nullptr) {
+  auto &conditions = $$->selection.conditions;
+  conditions.insert(conditions.end(), $5->begin(), $5->end());
+  delete $5;
+}
+```
+
+SELECT 的语法是 `SELECT expression_list FROM rel_list where group_by`，因此 `$4` 是 FROM 的结果，`$5` 是 WHERE 的结果。
+
+先接收 ON 条件，再追加 WHERE 条件。原来只有 WHERE 时，可以直接交换整个条件列表；现在如果仍用 WHERE 替换列表，就会丢掉 ON 条件，导致不匹配的行也参与输出。
+
 原代码的 `SelectStmt::create` 会根据这些条件调用 `FilterStmt::create`，检查条件中的表和字段，构造内部过滤对象。随后，逻辑计划生成器把这些对象转换成比较表达式，并处理已有的隐式类型转换规则。
 
 这样 ON 和 WHERE 使用同一套字段解析、比较和类型转换能力，不需要再实现一份 ON 专用逻辑。后续补充的字符串与数值比较也在这条共同路径中处理。
+
+这里只利用本题内连接的性质；不能直接把同样的合并方式用于 LEFT JOIN 等外连接，因为它们还有补 NULL 行等语义。
 
 ### 6.5 临时对象如何释放
 
 `FromSqlNode` 和条件列表在语法动作中临时创建。正常解析时，代码通过 `swap` 转移列表，或通过 `insert` 追加内容，随后删除不再需要的临时对象。
 
 语法文件中还为新的 FROM 类型声明了 `%destructor`；解析出错、Bison 丢弃对应符号时，可以释放该临时结构。这避免新增的解析结构在错误路径上被遗留。
+
+同一文件还增加 INNER/JOIN token，并用 `%union`、`%type` 告诉 Bison 新规则使用 FromSqlNode 指针。这些是让新结构接入解析器所需的配套声明。
+
+`lex_sql.cpp`、`yacc_sql.cpp` 等由 CMake 调用 Flex/Bison 根据 `.l`、`.y` 自动生成，且已被 Git 忽略，所以修改规则源码即可。
+
+### 6.6 已有语义分析怎样接上这次改动
+
+下面的代码没有因本题修改，只需理解它们的衔接关系：
+
+| 文件/函数 | 在本题中的作用 |
+| --- | --- |
+| `src/observer/sql/stmt/select_stmt.cpp`：SelectStmt::create | 按 relations 查找真实 Table 对象，收集表并绑定 SELECT 字段 |
+| `src/observer/sql/stmt/filter_stmt.cpp`：FilterStmt::create | 把 conditions 中每个条件转换成 FilterUnit |
+| 同文件：get_table_and_field | 通过表名、字段名找到真实表与字段元数据 |
+
+语法阶段的 `t.id` 还只是名称，绑定后得到的 Field 则知道自己属于哪个 Table。后面的计划生成器才能判断条件依赖哪些表。不存在的表和字段会在检查阶段返回错误。
 
 ## 7. 执行计划：让条件尽早过滤
 
@@ -326,24 +410,88 @@ WHERE t2.score > 60;
 
 不匹配的 t、t1 组合会在参与下一次连接之前被丢弃；t2 中分数不达标的记录也不必参与连接。这种把条件安排到更早执行位置的做法通常称为“谓词下推”，这里的“谓词”就是产生真或假结果的条件。
 
-### 7.3 apply_predicates 的具体工作
+### 7.3 先拆开原来的总 AND 条件
 
-代码先复用原流程生成比较表达式，保留其中已经完成的类型转换，然后把 AND 中的各个比较取出来，作为待安排的条件列表。
+修改函数：`LogicalPlanGenerator::create_plan(SelectStmt *, ...)`。
 
-新增的 `apply_predicates` 接收当前逻辑算子和当前可用的表列表。它对每个待安排条件执行以下操作：
+原流程已经能从 FilterStmt 构造一个包含 AND 的过滤算子，其中的比较也已处理类型转换。本次先复用它，再取出里面的条件：
 
-1. 遍历条件表达式，找到其中引用的字段。
-2. 检查这些字段所属的表是否全部可用。
-3. 如果全部可用，把条件移到当前算子上方的过滤算子中。
-4. 如果有表尚不可用，保留条件，等待后面的连接步骤。
+```cpp
+vector<unique_ptr<Expression>> predicates;
+if (predicate_oper) {
+  auto *conjunction = static_cast<ConjunctionExpr *>(
+      predicate_oper->expressions().front().get());
+  predicates.swap(conjunction->children());
+  predicate_oper.reset();
+}
+```
 
-构建每张表的扫描计划时，先使用只有该表的可用列表调用一次，因此单表条件可以提前处理。
+`predicates` 是尚未安排执行位置的条件列表。这样不需要再构造一份比较，也不会丢失已有 CastExpr。
 
-每连接进一张新表后，再使用已经连接的全部表调用一次，因此跨表条件可以在所需数据齐全时立即处理。
+### 7.4 apply_predicates 怎样判断条件能否执行
 
-条件被安排后会从待安排列表移走，不会在后续步骤重复挂载。
+新增的局部函数接收当前逻辑算子和当前可用的表列表：
 
-### 7.4 为什么要进入类型转换表达式内部
+```cpp
+auto apply_predicates = [&](unique_ptr<LogicalOperator> &oper,
+                            const vector<Table *> &available_tables) {
+  // 检查并安排当前能执行的条件
+};
+```
+
+`oper` 是当前计划子树，`available_tables` 表示这棵子树能提供哪些表的数据。它遍历每个条件的表达式，检查字段所属的 Table 是否全部可用。
+
+检查字段的关键代码为：
+
+```cpp
+if (expr->type() == ExprType::FIELD) {
+  const Table *table = static_cast<FieldExpr *>(expr.get())->field().table();
+  bool found = false;
+  for (Table *available_table : available_tables) {
+    found = found || table == available_table;
+  }
+  available = available && found;
+}
+return ExpressionIterator::iterate_child_expr(*expr, check_fields);
+```
+
+例如 `t.id=t1.id`：只有 t 可用时不能判断；t、t1 都可用时才能判断。代码比较的是已绑定的真实 Table 对象，不是靠字段名称猜测。
+
+能执行的条件加入 ready，并从待安排列表移走，避免后续重复挂载；缺表的条件保留给后面的连接步骤。ready 中的条件重新组成 AND，包装当前计划：
+
+```cpp
+if (!ready.empty()) {
+  auto conjunction = make_unique<ConjunctionExpr>(ConjunctionExpr::Type::AND, ready);
+  auto predicate = make_unique<PredicateLogicalOperator>(std::move(conjunction));
+  predicate->add_child(std::move(oper));
+  oper = std::move(predicate);
+}
+```
+
+包装后变成“过滤算子 → 原来的子树”。原子树提供记录，过滤算子负责判断。这里的 `std::move` 转移对象所有权，不是复制整张表或全部中间记录。
+
+### 7.5 为什么每接入一张表调用两次
+
+构建每张表的扫描计划时，先调用：
+
+```cpp
+apply_predicates(table_get_oper, vector<Table *>{table});
+```
+
+这次只有一张表可用，因此能安排 `t2.score>60` 等单表条件。
+
+把新表接入已有连接子树后，再调用：
+
+```cpp
+joined_tables.push_back(table);
+apply_predicates(table_oper, joined_tables);
+```
+
+这次可以读取已经连接的全部表，因此能安排 `t.id=t1.id` 等跨表条件。连接子树按表的书写顺序逐步构建：先连接前两表，再把它们的结果与第三表连接。
+
+已有的 `predicate_pushdown_rewriter.cpp` 还可以把扫描上方的单表过滤移进 TABLE_GET，最终由扫描算子执行。因此实际 EXPLAIN 有时直接显示 TABLE_SCAN，而不单独显示该单表过滤节点。
+
+### 7.6 为什么要进入类型转换表达式内部
 
 例如：
 
@@ -364,7 +512,11 @@ ON t.int_id = t1.float_id
 
 因此代码使用已有的 `ExpressionIterator` 递归访问子表达式，连同类型转换内部的字段一起检查。ON 和 WHERE 共用转换路径，整数和浮点数的转换沿用原有规则；字符串与数值比较的补充规则如下。
 
-#### 字符串与数值比较：为什么 '16a' 不能返回 FAILURE
+## 8. 字符串与数值比较：为什么 '16a' 不能返回 FAILURE
+
+涉及两个文件：`src/observer/sql/optimizer/logical_plan_generator.cpp` 和 `src/observer/common/type/char_type.cpp`。
+
+### 8.1 根因：计划阶段没有可用的类型转换方向
 
 后续反馈暴露了初次验证遗漏的混合类型场景：
 
@@ -377,13 +529,51 @@ AND join_table_1.id = join_table_2.id;
 
 当 name 为 CHAR、age 为 INT 或 FLOAT 时，原类型转换代价表没有提供可用的转换方向，计划生成器会在执行连接前返回不支持，客户端显示 FAILURE。
 
-这属于本题需要覆盖的 ON 比较，因此补充以下处理：
+这属于本题需要覆盖的 ON 比较，需要同时修改“计划选择什么转换”和“类型层怎样执行转换”。只改其中一处不够。
 
-1. 生成比较表达式时，发现一侧为 CHAR、另一侧为 INT/FLOAT，就为字符串一侧添加转 FLOAT 的 CastExpr。
-2. 如果另一侧是 INT，继续使用已有规则把 INT 提升为 FLOAT，使两侧按数值比较。
-3. 在 CharType::cast_to 中补充 FLOAT 分支，调用已有的 Value::get_float() 读取数字前缀。
+### 8.2 logical_plan_generator.cpp：比较前统一为数值类型
 
-已有的 Value::get_float() 能处理数字前缀；没有有效数字前缀时返回 0。因此：
+修改函数：`LogicalPlanGenerator::create_plan(FilterStmt *, ...)`。注意它与上一节安排条件位置的 SelectStmt 重载是同文件中的两个函数。
+
+从 FilterUnit 构造左右 FieldExpr/ValueExpr 后，增加：
+
+```cpp
+if (left->value_type() == AttrType::CHARS &&
+    (right->value_type() == AttrType::INTS || right->value_type() == AttrType::FLOATS)) {
+  left = make_unique<CastExpr>(std::move(left), AttrType::FLOATS);
+} else if (right->value_type() == AttrType::CHARS &&
+           (left->value_type() == AttrType::INTS || left->value_type() == AttrType::FLOATS)) {
+  right = make_unique<CastExpr>(std::move(right), AttrType::FLOATS);
+}
+```
+
+字符串一侧被包上一层转 FLOAT 的表达式；另一侧如果是 INT，则继续使用原有规则提升为 FLOAT。最终变成 `FLOAT(name 的数字前缀) < FLOAT(age)`。
+
+选择 FLOAT 是为了保留字符串中的小数。例如 `'16.5a' > 16` 应成立，若先转 INT 变成 16，就会得出错误结果。比较的左右两侧都做了对应处理，所以 `name<age` 和 `age>name` 使用同样的数值解释。
+
+### 8.3 char_type.cpp：真正执行 CHAR → FLOAT
+
+修改函数：`CharType::cast_to`，增加 FLOATS 分支：
+
+```cpp
+case AttrType::FLOATS: {
+  result.set_float(val.get_float());
+  return RC::SUCCESS;
+}
+```
+
+CastExpr 只是声明需要转换；读取一条记录时，真正的调用关系是：
+
+```text
+CastExpr::get_value
+  → 从子表达式读取原值
+  → Value::cast_to
+  → 根据源类型 CHAR 调用 CharType::cast_to
+  → Value::get_float 解析数字前缀
+  → 得到 FLOAT 类型的 Value
+```
+
+Value::get_float 原本已经存在，本次没有修改它，而是接上其已有转换能力。它使用 `stof` 读取数字前缀，解析异常时按已有逻辑返回 0。因此：
 
 | 原字符串 | 参与数值比较的值 |
 | --- | --- |
@@ -394,25 +584,31 @@ AND join_table_1.id = join_table_2.id;
 | `'2e1x'` | 20 |
 | `'abc'` 或空字符串 | 0 |
 
-选择 FLOAT 是为了保留字符串中的小数。例如 `'16.5a' > 16` 应成立，若先转 INT 变成 16，就会得出错误结果。字符串出现在比较左侧或右侧都按同样的规则处理。
-
 两侧均为 CHAR 时继续按字符串规则比较，例如 `'10' < '2'` 仍是字符串的字典序比较。日期转换和原有数字之间的转换规则保持原样。
 
-本次只在比较计划中为 CHAR 与 INT/FLOAT 的组合选择这个转换，不增加字符串转 INT 等其他转换，也不把所有字符串比较一律改为数值比较。
+没有修改 CharType::cast_cost：这里直接在比较计划中为 CHAR 与 INT/FLOAT 选择转 FLOAT，随后沿用原有数值转换规则。类型层新增的是实际转换分支，不是把所有字符串比较都改为数值比较。
+
+转换只影响表达式求值，不改写原表，因此结果中仍然输出原字符串 `'16a'`。
 
 例如为 id=4 插入 `age=17` 的匹配记录后，上述查询应输出包含 `(4, '16a', 4, 17)` 的结果；若 age=16，查询应正常执行并过滤掉这一组合。
 
-### 7.5 性能边界
+### 8.4 与条件提前执行、索引的关系
+
+转换后字段藏在 CastExpr 内部，所以前面的条件依赖检查必须递归进入子表达式，确保对应表可读后才求值。
+
+带索引时，也不能把原始字段值直接当作转换后的 FLOAT 值查找。现有索引选择逻辑要求相应的字段/常量表达式形态，出现转换表达式时可能采用表扫描，逐行算出正确比较值。本题没有增加“转换后的表达式索引”。
+
+### 8.5 性能边界
 
 本次执行仍然使用已有的嵌套循环连接。两张表分别有 M、N 行时，最坏仍可能需要 `M × N` 次组合比较。
 
 提前过滤主要减少不匹配记录参与后续连接的次数，避免多表连接的条件全部拖到最后执行。本次没有增加哈希连接、连接顺序搜索等额外功能。
 
-## 8. 执行器：每次 next() 返回一条组合记录
+## 9. 执行器：每次 next() 返回一条组合记录
 
 修改文件：`src/observer/sql/operator/nested_loop_join_physical_operator.cpp`。
 
-### 8.1 嵌套循环连接是什么
+### 9.1 嵌套循环连接是什么
 
 最直观的连接方式类似下面的双重循环：
 
@@ -425,7 +621,7 @@ AND join_table_1.id = join_table_2.id;
 
 左侧也可以是前面两张表的连接结果，因此相同的两输入连接组件可以逐层组成多表连接。
 
-### 8.2 next() 的返回值代表什么
+### 9.2 next() 的返回值代表什么
 
 MiniOB 的执行算子按需逐条提供记录。上层调用 `next()`，可以理解为“请准备下一条记录”。
 
@@ -437,7 +633,7 @@ MiniOB 的执行算子按需逐条提供记录。上层调用 `next()`，可以�
 
 上层过滤算子取得记录后判断条件：满足时向上返回，不满足时继续向下请求下一条。
 
-### 8.3 原代码的问题和修正
+### 9.3 原代码的问题和修正
 
 原来的连接执行器在 `right_next()` 成功取得右侧记录后，仍继续内部循环，没有把当前左右组合返回给上层。它会继续遍历，最后到达结束状态，导致已有多表执行框架无法正常输出组合记录。
 
@@ -455,9 +651,33 @@ if (rc == RC::SUCCESS) {
 
 下一次调用 `next()` 时继续遍历右侧；右侧遍历完后，再推进左侧并重新扫描右侧。这既能保留一对多匹配，也能支持逐层构成多表连接。
 
+例如左侧有 A、B 两行，右侧有 X、Y 两行：
+
+```text
+第 1 次 next()：准备 A+X，返回 SUCCESS
+第 2 次 next()：准备 A+Y，返回 SUCCESS
+第 3 次 next()：右侧结束，推进左侧并重开右侧，准备 B+X
+第 4 次 next()：准备 B+Y，返回 SUCCESS
+第 5 次 next()：左侧也结束，返回 RECORD_EOF
+```
+
+`round_done_` 标记右侧一轮结束，left_next 推进左侧，right_next 负责必要时重新打开右侧。这些已有逻辑保持原样；本次补的是成功组合的返回位置。
+
 执行过程中逐条传递组合记录，无需一次性保存所有组合。
 
-## 9. 用题目示例串起整个过程
+### 9.4 已有组件怎样完成“组合、过滤、输出”
+
+下面的文件没有因本题修改，只是复用：
+
+| 文件 | 作用 |
+| --- | --- |
+| `src/observer/sql/expr/tuple.h` | JoinedTuple 保存当前左右 Tuple 引用，按表名、字段名从相应一侧取值；左侧也可以是前面两表的 JoinedTuple |
+| `src/observer/sql/operator/predicate_physical_operator.cpp` | 反复调用下层 next()，条件为真就向上返回，否则继续索取下一条组合 |
+| `src/observer/sql/optimizer/physical_plan_generator.cpp` | 把逻辑 JOIN 转换为 NestedLoopJoinPhysicalOperator，把逻辑过滤转换成对应物理过滤器 |
+
+因此跨表条件由连接上方的过滤器检查，连接器负责产生组合。这两个组件配合完成本题内连接，不需要把 ON 判断另写进连接器。
+
+## 10. 用题目示例串起整个过程
 
 ```sql
 SELECT * FROM t INNER JOIN t1 ON t.id = t1.id, t2
@@ -479,17 +699,17 @@ WHERE t2.id = t.id;
 
 最终留下的每条记录，都满足两个连接条件。
 
-## 10. 验证结果与清理
+## 11. 验证结果与清理
 
-验证在本机已有的 `obtest` Docker 开发容器中完成。
+以下是实现与后续修复时在 `obtest` Docker 开发容器中完成的验证记录。本次只扩写讲解文档，没有重新运行这些测试。
 
-### 10.1 编译与语法检查
+### 11.1 编译与语法检查
 
 - 使用 `cmake --build build --target observer -j4` 编译，成功生成 observer。
 - 使用 Bison 检查新增语法，没有移进/归约冲突或归约/归约冲突。
 - `git diff --check` 通过。
 
-### 10.2 SQL 集成验证
+### 11.2 SQL 集成验证
 
 使用临时 Python 脚本启动独立的 observer 实例，通过 Unix socket 发送 SQL，并在 SQLite 中运行同样的合法查询，对照结果。
 
@@ -525,7 +745,7 @@ WHERE t2.id = t.id;
 
 SQLite 原生的字符串与数字混合比较规则不同，补充验证中的混合类型结果使用独立的数字前缀转换及逐对比较计算预期值；普通连接及纯字符串比较继续与 SQLite 对照。没有把 SQLite 的原生混合类型行为当成本题的预期。
 
-### 10.3 执行计划验证
+### 11.3 执行计划验证
 
 对于三表查询，EXPLAIN 返回了类似下面的实际计划：
 
@@ -543,8 +763,26 @@ PROJECT
 
 它表明：ja、jb 的条件在两表连接后执行；jc 的单表条件在扫描阶段执行；最后再检查需要第三张表参与的条件。
 
-### 10.4 清理情况
+### 11.4 清理情况
 
 本次创建的临时测试脚本、编译日志、临时语法生成文件和独立测试实例的数据目录均已删除。
 
 仓库原有的测试文件保持原样，保留本题功能源码修改和本文档。
+
+## 12. 实现范围与源码阅读顺序
+
+本次围绕 INNER JOIN、AND 条件和已有嵌套循环实现，没有增加外连接、表别名、自连接别名支持、OR、复杂 ON 表达式、哈希连接或连接顺序搜索。
+
+连接组最终整理成表列表和条件列表，没有保留完整 JOIN 树，也没有增加严格的逐个 ON 名称作用域校验。本文混用示例都引用对应连接组可见的字段；不能把这个简化实现理解成完整 SQL JOIN 语义。
+
+CHAR/数值比较使用仓库已有的 FLOAT 精度和比较规则，没有增加高精度数值类型。
+
+建议阅读顺序：
+
+1. lex_sql.l、parse_defs.h：认识关键字和新增中间结构。
+2. yacc_sql.y 的 joined_table、join_condition_list、select_stmt：看清表与条件如何收集、合并。
+3. logical_plan_generator.cpp 的两个 create_plan：SelectStmt 版本安排过滤位置，FilterStmt 版本构造比较与转换。
+4. char_type.cpp 的 FLOATS 分支：理解字符串怎样得到数值。
+5. nested_loop_join_physical_operator.cpp 的 next()：理解记录怎样逐条返回。
+
+其他已有模块按正文的衔接表查阅即可。
