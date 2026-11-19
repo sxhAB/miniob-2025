@@ -16,6 +16,8 @@ See the Mulan PSL v2 for more details. */
 #include "common/lang/string.h"
 #include "common/log/log.h"
 #include "sql/parser/parse_defs.h"
+#include "storage/record/vector_record.h"
+#include "common/type/vector_type.h"
 
 #include "json/json.h"
 
@@ -46,6 +48,9 @@ RC FieldMeta::init(const char *name, AttrType attr_type, int attr_offset, int at
               name, attr_type, attr_offset, attr_len);
     return RC::INVALID_ARGUMENT;
   }
+  if (attr_type == AttrType::VECTORS && attr_len > VectorType::MAX_DIMENSION) {
+    return RC::INVALID_ARGUMENT;
+  }
 
   name_        = name;
   attr_type_   = attr_type;
@@ -64,7 +69,7 @@ AttrType FieldMeta::type() const { return attr_type_; }
 
 int FieldMeta::offset() const { return attr_offset_; }
 
-int FieldMeta::len() const { return attr_len_; }
+int FieldMeta::len() const { return attr_type_ == AttrType::VECTORS ? sizeof(VectorRecord) : attr_len_; }
 
 bool FieldMeta::visible() const { return visible_; }
 

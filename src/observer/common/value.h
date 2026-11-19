@@ -118,6 +118,10 @@ public:
 public:
   void set_int(int val);
   void set_float(float val);
+  // Vector length is measured in bytes; each element is a four-byte float.
+  void set_vector(const float *data, int dimension);
+  int vector_dimension() const { return length_ / sizeof(float); }
+  float vector_at(int index) const;
   void set_string(const char *s, int len = 0);
   void set_empty_string(int len);
   void set_string_from_other(const Value &other);
@@ -134,6 +138,6 @@ private:
     char   *pointer_value_;
   } value_ = {.int_value_ = 0};
 
-  /// 是否申请并占有内存, 目前对于 CHARS 类型 own_data_ 为true, 其余类型 own_data_ 为false
+  /// CHARS and VECTORS own their dynamically allocated data.
   bool own_data_ = false;
 };

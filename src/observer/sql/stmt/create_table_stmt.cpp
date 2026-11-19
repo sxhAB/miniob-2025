@@ -16,9 +16,16 @@ See the Mulan PSL v2 for more details. */
 #include "common/types.h"
 #include "sql/stmt/create_table_stmt.h"
 #include "event/sql_debug.h"
+#include "common/type/vector_type.h"
 
 RC CreateTableStmt::create(Db *db, const CreateTableSqlNode &create_table, Stmt *&stmt)
 {
+  for (const auto &attribute : create_table.attr_infos) {
+    if (attribute.type == AttrType::VECTORS &&
+        (attribute.length <= 0 || attribute.length > VectorType::MAX_DIMENSION)) {
+      return RC::INVALID_ARGUMENT;
+    }
+  }
   StorageFormat storage_format = get_storage_format(create_table.storage_format.c_str());
   if (storage_format == StorageFormat::UNKNOWN_FORMAT) {
     return RC::INVALID_ARGUMENT;

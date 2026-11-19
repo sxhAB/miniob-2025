@@ -50,6 +50,26 @@ RC ExpressionBinder::bind_expression(unique_ptr<Expression> &expr, vector<unique
   }
 
   switch (expr->type()) {
+    case ExprType::VECTOR_FUNCTION: {
+      auto *function = static_cast<VectorFunctionExpr *>(expr.get());
+      for (auto &argument : function->arguments()) {
+        vector<unique_ptr<Expression>> bound;
+        RC rc = bind_expression(argument, bound);
+        if (rc != RC::SUCCESS) {
+          return rc;
+        }
+        if (bound.size() != 1) {
+          return RC::INVALID_ARGUMENT;
+        }
+        argument = std::move(bound[0]);
+      }
+      RC rc = function->validate();
+      if (rc != RC::SUCCESS) {
+        return rc;
+      }
+      bound_expressions.emplace_back(std::move(expr));
+      return RC::SUCCESS;
+    }
     case ExprType::STAR: {
       return bind_star_expression(expr, bound_expressions);
     } break;
@@ -169,7 +189,7 @@ RC ExpressionBinder::bind_unbound_field_expression(
 
     Field      field(table, field_meta);
     FieldExpr *field_expr = new FieldExpr(field);
-    field_expr->set_name(field_name);
+    field_expr->set_name(unbound_field_expr->has_alias() ? expr->name() : field_name);
     bound_expressions.emplace_back(field_expr);
   }
 

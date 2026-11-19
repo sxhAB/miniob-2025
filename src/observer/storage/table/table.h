@@ -119,11 +119,13 @@ public:
   const TableMeta &table_meta() const;
 
   LobFileHandler *lob_handler() const { return lob_handler_; }
+  RC read_vector(const char *descriptor, const FieldMeta &field, Value &value) const;
 
   RC sync();
 
 private:
   RC set_value_to_record(char *record_data, const Value &value, const FieldMeta *field);
+  RC open_vector_file(const char *base_dir, bool create);
 
 private:
   // RC init_record_handler(const char *base_dir);

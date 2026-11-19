@@ -28,6 +28,7 @@ RC LobFileHandler::open_file(const char *file_name)
 
 RC LobFileHandler::insert_data(int64_t &offset, int64_t length, const char *data)
 {
+  lock_guard<mutex> guard(mutex_);
   RC       rc         = RC::SUCCESS;
   int64_t  out_size   = 0;
   int64_t end_offset = 0;

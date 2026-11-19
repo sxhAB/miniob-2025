@@ -90,6 +90,10 @@ UnboundAggregateExpr *create_aggregate_expression(const char *aggregate_name,
         FLOAT_T
         DATE_T
         VECTOR_T
+        AS
+        STRING_TO_VECTOR
+        VECTOR_TO_STRING
+        DISTANCE
         HELP
         EXIT
         DOT //QUOTE
@@ -132,7 +136,6 @@ UnboundAggregateExpr *create_aggregate_expression(const char *aggregate_name,
   AttrInfoSqlNode *                          attr_info;
   Expression *                               expression;
   vector<unique_ptr<Expression>> *           expression_list;
-  vector<Value> *                            value_list;
   vector<ConditionSqlNode> *                 condition_list;
   vector<RelAttrSqlNode> *                   rel_attr_list;
   FromSqlNode *                              from;
@@ -148,7 +151,6 @@ UnboundAggregateExpr *create_aggregate_expression(const char *aggregate_name,
 %destructor { delete $$; } <attr_infos>
 %destructor { delete $$; } <expression>
 %destructor { delete $$; } <expression_list>
-%destructor { delete $$; } <value_list>
 %destructor { delete $$; } <condition_list>
 // %destructor { delete $$; } <rel_attr_list>
 %destructor { delete $$; } <from>
@@ -164,13 +166,13 @@ UnboundAggregateExpr *create_aggregate_expression(const char *aggregate_name,
 %type <number>              type
 %type <condition>           condition
 %type <value>               value
+%type <value>               condition_value
 %type <number>              number
 %type <cstring>             relation
 %type <comp>                comp_op
 %type <rel_attr>            rel_attr
 %type <attr_infos>          attr_def_list
 %type <attr_info>           attr_def
-%type <value_list>          value_list
 %type <condition_list>      where
 %type <condition_list>      condition_list
 %type <cstring>             storage_format
@@ -181,6 +183,9 @@ UnboundAggregateExpr *create_aggregate_expression(const char *aggregate_name,
 %type <condition_list>      join_condition_list
 %type <expression>          expression
 %type <expression>          aggregate_expression
+%type <expression>          vector_function
+%type <expression>          select_expression
+%type <expression_list>     select_expression_list
 %type <expression_list>     expression_list
 %type <expression_list>     group_by
 %type <cstring>             fields_terminated_by
@@ -375,7 +380,7 @@ attr_def:
       $$ = new AttrInfoSqlNode;
       $$->type = (AttrType)$2;
       $$->name = $1;
-      $$->length = 4;
+      $$->length = $$->type == AttrType::VECTORS ? 2048 : 4;
     }
     ;
 number:
@@ -416,28 +421,15 @@ attr_list:
     ;
 
 insert_stmt:        /*insert   语句的语法解析树*/
-    INSERT INTO ID VALUES LBRACE value_list RBRACE 
+    INSERT INTO ID VALUES LBRACE expression_list RBRACE
     {
       $$ = new ParsedSqlNode(SCF_INSERT);
       $$->insertion.relation_name = $3;
-      $$->insertion.values.swap(*$6);
+      $$->insertion.expressions.swap(*$6);
       delete $6;
     }
     ;
 
-value_list:
-    value
-    {
-      $$ = new vector<Value>;
-      $$->emplace_back(*$1);
-      delete $1;
-    }
-    | value_list COMMA value { 
-      $$ = $1;
-      $$->emplace_back(*$3);
-      delete $3;
-    }
-    ;
 value:
     NUMBER {
       $$ = new Value((int)$1);
@@ -489,7 +481,7 @@ update_stmt:      /*  update 语句的语法解析树*/
     }
     ;
 select_stmt:        /*  select 语句的语法解析树*/
-    SELECT expression_list FROM rel_list where group_by
+    SELECT select_expression_list FROM rel_list where group_by
     {
       $$ = new ParsedSqlNode(SCF_SELECT);
       if ($2 != nullptr) {
@@ -513,6 +505,35 @@ select_stmt:        /*  select 语句的语法解析树*/
       if ($6 != nullptr) {
         $$->selection.group_by.swap(*$6);
         delete $6;
+      }
+    }
+    | SELECT select_expression_list
+    {
+      $$ = new ParsedSqlNode(SCF_CALC);
+      $$->calc.expressions.swap(*$2);
+      delete $2;
+    }
+    ;
+select_expression_list:
+    select_expression
+    {
+      $$ = new vector<unique_ptr<Expression>>;
+      $$->emplace_back($1);
+    }
+    | select_expression_list COMMA select_expression
+    {
+      $$ = $1;
+      $$->emplace_back($3);
+    }
+    ;
+select_expression:
+    expression { $$ = $1; }
+    | expression AS ID
+    {
+      $$ = $1;
+      $$->set_name($3);
+      if ($$->type() == ExprType::UNBOUND_FIELD) {
+        static_cast<UnboundFieldExpr *>($$)->set_has_alias();
       }
     }
     ;
@@ -577,6 +598,28 @@ expression:
     }
     | aggregate_expression {
       $$ = $1;
+    }
+    | vector_function { $$ = $1; }
+    ;
+
+vector_function:
+    STRING_TO_VECTOR LBRACE expression_list RBRACE
+    {
+      $$ = new VectorFunctionExpr(VectorFunctionExpr::Function::FROM_STRING, std::move(*$3));
+      $$->set_name(token_name(sql_string, &@$));
+      delete $3;
+    }
+    | VECTOR_TO_STRING LBRACE expression_list RBRACE
+    {
+      $$ = new VectorFunctionExpr(VectorFunctionExpr::Function::TO_STRING, std::move(*$3));
+      $$->set_name(token_name(sql_string, &@$));
+      delete $3;
+    }
+    | DISTANCE LBRACE expression_list RBRACE
+    {
+      $$ = new VectorFunctionExpr(VectorFunctionExpr::Function::DISTANCE, std::move(*$3));
+      $$->set_name(token_name(sql_string, &@$));
+      delete $3;
     }
     ;
 
@@ -667,8 +710,22 @@ condition_list:
       delete $1;
     }
     ;
+condition_value:
+    value { $$ = $1; }
+    | vector_function
+    {
+      // WHERE still stores constant values in ConditionSqlNode.
+      unique_ptr<Expression> function($1);
+      Value result;
+      if (function->try_get_value(result) != RC::SUCCESS) {
+        yyerror(&@1, sql_string, sql_result, scanner, "invalid vector constant");
+        YYERROR;
+      }
+      $$ = new Value(std::move(result));
+    }
+    ;
 condition:
-    rel_attr comp_op value
+    rel_attr comp_op condition_value
     {
       $$ = new ConditionSqlNode;
       $$->left_is_attr = 1;
@@ -680,7 +737,7 @@ condition:
       delete $1;
       delete $3;
     }
-    | value comp_op value 
+    | condition_value comp_op condition_value
     {
       $$ = new ConditionSqlNode;
       $$->left_is_attr = 0;
@@ -704,7 +761,7 @@ condition:
       delete $1;
       delete $3;
     }
-    | value comp_op rel_attr
+    | condition_value comp_op rel_attr
     {
       $$ = new ConditionSqlNode;
       $$->left_is_attr = 0;

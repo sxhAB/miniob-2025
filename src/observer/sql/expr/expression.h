@@ -47,6 +47,7 @@ enum class ExprType
   CONJUNCTION,  ///< 多个表达式使用同一种关系(AND或OR)来联结
   ARITHMETIC,   ///< 算术运算
   AGGREGATION,  ///< 聚合运算
+  VECTOR_FUNCTION,
 };
 
 /**
@@ -141,6 +142,28 @@ private:
   string name_;
 };
 
+class VectorFunctionExpr : public Expression
+{
+public:
+  enum class Function { FROM_STRING, TO_STRING, DISTANCE };
+  VectorFunctionExpr(Function function, vector<unique_ptr<Expression>> arguments)
+      : function_(function), arguments_(std::move(arguments)) {}
+
+  unique_ptr<Expression> copy() const override;
+  bool equal(const Expression &other) const override;
+  ExprType type() const override { return ExprType::VECTOR_FUNCTION; }
+  AttrType value_type() const override;
+  RC get_value(const Tuple &tuple, Value &value) const override;
+  RC try_get_value(Value &value) const override;
+  RC validate() const;
+  vector<unique_ptr<Expression>> &arguments() { return arguments_; }
+
+private:
+  RC evaluate(const Tuple *tuple, Value &value) const;
+  Function function_;
+  vector<unique_ptr<Expression>> arguments_;
+};
+
 class StarExpr : public Expression
 {
 public:
@@ -170,7 +193,7 @@ public:
 
   virtual ~UnboundFieldExpr() = default;
 
-  unique_ptr<Expression> copy() const override { return make_unique<UnboundFieldExpr>(table_name_, field_name_); }
+  unique_ptr<Expression> copy() const override { return make_unique<UnboundFieldExpr>(*this); }
 
   ExprType type() const override { return ExprType::UNBOUND_FIELD; }
   AttrType value_type() const override { return AttrType::UNDEFINED; }
@@ -179,10 +202,13 @@ public:
 
   const char *table_name() const { return table_name_.c_str(); }
   const char *field_name() const { return field_name_.c_str(); }
+  bool has_alias() const { return has_alias_; }
+  void set_has_alias() { has_alias_ = true; }
 
 private:
   string table_name_;
   string field_name_;
+  bool has_alias_ = false;
 };
 
 /**

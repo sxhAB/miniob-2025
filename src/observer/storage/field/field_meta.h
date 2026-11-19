@@ -40,6 +40,7 @@ public:
   AttrType    type() const;
   int         offset() const;
   int         len() const;
+  int         vector_dimension() const { return attr_len_; }
   bool        visible() const;
   int         field_id() const;
 

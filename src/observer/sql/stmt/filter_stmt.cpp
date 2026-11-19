@@ -125,6 +125,16 @@ RC FilterStmt::create_filter_unit(Db *db, Table *default_table, unordered_map<st
     filter_unit->set_right(filter_obj);
   }
 
+  const auto &left = filter_unit->left();
+  const auto &right = filter_unit->right();
+  const AttrType left_type = left.is_attr ? left.field.attr_type() : left.value.attr_type();
+  const AttrType right_type = right.is_attr ? right.field.attr_type() : right.value.attr_type();
+  if ((left_type == AttrType::VECTORS || right_type == AttrType::VECTORS) &&
+      (left_type != right_type || (comp != EQUAL_TO && comp != NOT_EQUAL))) {
+    delete filter_unit;
+    filter_unit = nullptr;
+    return RC::SCHEMA_FIELD_TYPE_MISMATCH;
+  }
   filter_unit->set_comp(comp);
 
   // 检查两个类型是否能够比较

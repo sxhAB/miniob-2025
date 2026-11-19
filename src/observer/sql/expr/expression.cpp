@@ -141,6 +141,11 @@ ComparisonExpr::~ComparisonExpr() {}
 
 RC ComparisonExpr::compare_value(const Value &left, const Value &right, bool &result) const
 {
+  if (left.attr_type() == AttrType::VECTORS || right.attr_type() == AttrType::VECTORS) {
+    if (left.attr_type() != right.attr_type() || (comp_ != EQUAL_TO && comp_ != NOT_EQUAL)) {
+      return RC::SCHEMA_FIELD_TYPE_MISMATCH;
+    }
+  }
   RC  rc         = RC::SUCCESS;
   int cmp_result = left.compare(right);
   result         = false;

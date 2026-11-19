@@ -23,6 +23,14 @@ RC ExpressionIterator::iterate_child_expr(Expression &expr, function<RC(unique_p
   RC rc = RC::SUCCESS;
 
   switch (expr.type()) {
+    case ExprType::VECTOR_FUNCTION: {
+      for (auto &argument : static_cast<VectorFunctionExpr &>(expr).arguments()) {
+        rc = callback(argument);
+        if (rc != RC::SUCCESS) {
+          break;
+        }
+      }
+    } break;
     case ExprType::CAST: {
       auto &cast_expr = static_cast<CastExpr &>(expr);
       rc = callback(cast_expr.child());

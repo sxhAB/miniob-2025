@@ -34,9 +34,11 @@ See the Mulan PSL v2 for more details. */
 #include "storage/record/lsm_record_scanner.h"
 #include "storage/table/heap_table_engine.h"
 #include "storage/table/lsm_table_engine.h"
+#include "storage/record/vector_record.h"
 
 Table::~Table()
 {
+  engine_.reset();
   if (lob_handler_ != nullptr) {
     delete lob_handler_;
     lob_handler_ = nullptr;
@@ -98,6 +100,11 @@ RC Table::create(Db *db, int32_t table_id, const char *path, const char *name, c
 
   db_       = db;
 
+  rc = open_vector_file(base_dir, true);
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
+
   string             data_file = table_data_file(base_dir, name);
   BufferPoolManager &bpm       = db->buffer_pool_manager();
   rc                           = bpm.create_file(data_file.c_str());
@@ -151,7 +158,10 @@ RC Table::open(Db *db, const char *meta_file, const char *base_dir)
   //   // don't need to remove the data_file
   //   return rc;
   // }
-  RC rc = RC::SUCCESS;
+  RC rc = open_vector_file(base_dir, false);
+  if (rc != RC::SUCCESS) {
+    return rc;
+  }
 
   if (table_meta_.storage_engine() == StorageEngine::HEAP) {
     engine_ = make_unique<HeapTableEngine>(&table_meta_, db_, this);
@@ -267,6 +277,19 @@ RC Table::make_update_record(const Record &old_record, const FieldMeta &field, c
 
 RC Table::set_value_to_record(char *record_data, const Value &value, const FieldMeta *field)
 {
+  if (field->type() == AttrType::VECTORS) {
+    if (value.attr_type() != AttrType::VECTORS || value.vector_dimension() <= 0 ||
+        value.vector_dimension() > field->vector_dimension() || lob_handler_ == nullptr) {
+      return RC::SCHEMA_FIELD_TYPE_MISMATCH;
+    }
+    VectorRecord descriptor{0, value.length()};
+    RC rc = lob_handler_->insert_data(descriptor.offset, descriptor.length, value.data());
+    if (rc != RC::SUCCESS) {
+      return rc;
+    }
+    memcpy(record_data + field->offset(), &descriptor, sizeof(descriptor));
+    return RC::SUCCESS;
+  }
   size_t       copy_len = field->len();
   const size_t data_len = value.length();
   if (field->type() == AttrType::CHARS) {
@@ -276,6 +299,35 @@ RC Table::set_value_to_record(char *record_data, const Value &value, const Field
   }
   memcpy(record_data + field->offset(), value.data(), copy_len);
   return RC::SUCCESS;
+}
+
+RC Table::open_vector_file(const char *base_dir, bool create)
+{
+  for (int i = table_meta_.sys_field_num(); i < table_meta_.field_num(); ++i) {
+    if (table_meta_.field(i)->type() == AttrType::VECTORS) {
+      const string path = table_lob_file(base_dir, name());
+      lob_handler_ = new LobFileHandler;
+      return create ? lob_handler_->create_file(path.c_str()) : lob_handler_->open_file(path.c_str());
+    }
+  }
+  return RC::SUCCESS;
+}
+
+RC Table::read_vector(const char *data, const FieldMeta &field, Value &value) const
+{
+  VectorRecord descriptor;
+  memcpy(&descriptor, data, sizeof(descriptor));
+  if (lob_handler_ == nullptr || descriptor.offset < 0 || descriptor.length <= 0 ||
+      descriptor.length % sizeof(float) != 0 ||
+      descriptor.length / sizeof(float) > static_cast<size_t>(field.vector_dimension())) {
+    return RC::INVALID_ARGUMENT;
+  }
+  vector<float> elements(descriptor.length / sizeof(float));
+  RC rc = lob_handler_->get_data(descriptor.offset, descriptor.length, reinterpret_cast<char *>(elements.data()));
+  if (rc == RC::SUCCESS) {
+    value.set_vector(elements.data(), elements.size());
+  }
+  return rc;
 }
 
 RC Table::get_record_scanner(RecordScanner *&scanner, Trx *trx, ReadWriteMode mode)
