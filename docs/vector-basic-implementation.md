@@ -313,4 +313,4 @@ LOB 写入浮点数组，返回文件位置
 
 测试使用的临时脚本和临时数据库目录均已删除，功能提交中仅保留实现代码。
 
-功能代码提交：`7bde928c0ee12384125c792ef819cea8076e9c12`，提交说明为 `feat: implement basic vector database support`。
+功能代码提交：`7bde928c0ee12384125c792ef819cea8076e9c12`，提交说明为 `feat: implement basic vector database support`。之后又补充了计算查询的错误返回处理：常量表达式会在发送结果表头前求值，维度不匹配时返回普通 `FAILURE`，不会因为执行错误关闭客户端连接。

@@ -32,7 +32,20 @@ public:
   string name() const override { return "CALC"; }
   string param() const override { return ""; }
 
-  RC open(Trx *trx) override { return RC::SUCCESS; }
+  RC open(Trx *trx) override
+  {
+    // Evaluate constant expressions before the communicator writes the result header.
+    // If an expression is invalid (for example, DISTANCE with different dimensions),
+    // open() can return the error and the client receives a normal FAILURE response.
+    for (int i = 0; i < tuple_.cell_num(); ++i) {
+      Value value;
+      RC rc = tuple_.cell_at(i, value);
+      if (rc != RC::SUCCESS) {
+        return rc;
+      }
+    }
+    return RC::SUCCESS;
+  }
   RC next() override
   {
     RC rc = RC::SUCCESS;
@@ -42,14 +55,6 @@ public:
     }
     emitted_ = true;
 
-    int cell_num = tuple_.cell_num();
-    for (int i = 0; i < cell_num; i++) {
-      Value value;
-      rc = tuple_.cell_at(i, value);
-      if (OB_FAIL(rc)) {
-        return rc;
-      }
-    }
     return RC::SUCCESS;
   }
   RC close() override { return RC::SUCCESS; }
